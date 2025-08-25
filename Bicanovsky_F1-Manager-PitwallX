@@ -1,0 +1,680 @@
+import React, { useMemo, useState } from "react";
+
+// ------------------------------------------------------------
+// F1 Manager 2024 – Monte Carlo Strategy Lab
+// Single-file React app for ChatGPT Canvas
+// ------------------------------------------------------------
+// What this does
+// - Lets you enter tyre models (base pace, degradation, warmup)
+// - Configures race parameters, safety car/VSC behavior, pit loss
+// - Defines multiple strategies as sequences of [compound, laps]
+// - Runs Monte Carlo simulations across strategies with a shared
+//   random seed stream and shared SC/VSC schedules (fair comparison)
+// - Shows time distributions, summary stats, and a lightweight
+//   undercut/overcut advisor
+// ------------------------------------------------------------
+
+// Types
+
+type Compound = "S" | "M" | "H";
+
+interface TyreModel {
+  base: number; // base lap time @ age 0 & zero fuel (s)
+  deg: number;  // degradation per lap (s/lap)
+  warmup: number; // out-lap extra (s)
+}
+
+interface TyreModels { S: TyreModel; M: TyreModel; H: TyreModel }
+
+interface Stint { compound: Compound; laps: number }
+
+interface Strategy { id: string; name: string; stints: Stint[]; color: string }
+
+interface RaceSettings {
+  laps: number;
+  fuelPerLap: number; // s/lap per lap of fuel remaining
+  noiseSigma: number; // driver/random noise (s)
+  trafficProb: number; // probability per lap of traffic add-on
+  trafficMax: number; // max traffic penalty added (s)
+  pitLossMean: number; // base pit lane loss (s)
+  pitLossSigma: number; // pit time variability (s)
+  seed: number; // random seed base
+  sims: number; // number of Monte Carlo runs
+}
+
+interface SafetyCarSettings {
+  scStartProb: number;   // per-lap probability an SC starts
+  scMin: number;         // min SC duration (laps)
+  scMax: number;         // max SC duration (laps)
+  scLapDelta: number;    // time added to lap under SC (s)
+  scPitReduction: number;// pit loss reduction if pitting under SC (s)
+  vscStartProb: number;  // per-lap probability a VSC starts
+  vscMin: number;
+  vscMax: number;
+  vscLapDelta: number;
+  vscPitReduction: number;
+}
+
+// Simple RNG (Mulberry32) so results are reproducible across strategies
+function mulberry32(a: number) {
+  return function() {
+    let t = (a += 0x6D2B79F5);
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function normal01(rand: () => number) {
+  // Box-Muller transform
+  let u = 0, v = 0;
+  while (u === 0) u = rand();
+  while (v === 0) v = rand();
+  return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+}
+
+function sampleNormal(rand: () => number, mean = 0, std = 1) {
+  return mean + std * normal01(rand);
+}
+
+function clamp(n: number, lo: number, hi: number) {
+  return Math.max(lo, Math.min(hi, n));
+}
+
+// Generate SC/VSC schedule once per simulation index, reused across strategies
+interface Phase { kind: "NONE" | "SC" | "VSC"; laps: number }
+
+function generateRacePhases(
+  rand: () => number,
+  laps: number,
+  sc: SafetyCarSettings
+): Phase[] {
+  const phases: Phase[] = [];
+  let lap = 1;
+  while (lap <= laps) {
+    const r = rand();
+    let started = false;
+    // Try SC first
+    if (!started && r < sc.scStartProb) {
+      const d = Math.floor(sc.scMin + rand() * (sc.scMax - sc.scMin + 1));
+      phases.push({ kind: "SC", laps: Math.min(d, laps - lap + 1) });
+      lap += d;
+      started = true;
+      continue;
+    }
+    // Try VSC
+    if (!started && rand() < sc.vscStartProb) {
+      const d = Math.floor(sc.vscMin + rand() * (sc.vscMax - sc.vscMin + 1));
+      phases.push({ kind: "VSC", laps: Math.min(d, laps - lap + 1) });
+      lap += d;
+      started = true;
+      continue;
+    }
+    // No intervention for 1 lap
+    phases.push({ kind: "NONE", laps: 1 });
+    lap += 1;
+  }
+  return phases;
+}
+
+// Simulate a single strategy using a provided RNG and intervention schedule
+function simulateStrategy(
+  strategy: Strategy,
+  tyres: TyreModels,
+  race: RaceSettings,
+  sc: SafetyCarSettings,
+  phases: Phase[],
+  rand: () => number
+): number {
+  // Validate lap count
+  const totalStintLaps = strategy.stints.reduce((a, s) => a + s.laps, 0);
+  if (totalStintLaps !== race.laps) {
+    // If mismatch, proportionally scale last stint to fit
+    const delta = race.laps - totalStintLaps;
+    if (strategy.stints.length > 0) {
+      strategy.stints[strategy.stints.length - 1].laps += delta;
+    }
+  }
+
+  let time = 0;
+  let fuelLaps = race.laps;
+  let pitLossBase = race.pitLossMean;
+
+  // We'll walk through phases while we count laps
+  let phaseIdx = 0;
+  let lapsIntoPhase = 0;
+
+  const nextLapPhase = () => {
+    // Move to next lap phase accounting
+    const p = phases[phaseIdx];
+    lapsIntoPhase += 1;
+    if (lapsIntoPhase >= p.laps) {
+      phaseIdx = Math.min(phaseIdx + 1, phases.length - 1);
+      lapsIntoPhase = 0;
+    }
+  };
+
+  for (const stint of strategy.stints) {
+    const tyre = tyres[stint.compound];
+    for (let age = 0; age < stint.laps; age++) {
+      const p = phases[phaseIdx];
+
+      // Base laptime model
+      let lapTime = tyre.base + tyre.deg * age + race.fuelPerLap * fuelLaps;
+      lapTime += sampleNormal(rand, 0, race.noiseSigma);
+
+      // Out-lap warmup
+      if (age === 0) lapTime += tyre.warmup;
+
+      // Traffic (optional)
+      if (rand() < race.trafficProb) {
+        lapTime += rand() * race.trafficMax; // up to trafficMax seconds
+      }
+
+      // Interventions
+      if (p.kind === "SC") {
+        lapTime += sc.scLapDelta;
+      } else if (p.kind === "VSC") {
+        lapTime += sc.vscLapDelta;
+      }
+
+      time += lapTime;
+      fuelLaps -= 1;
+
+      // Advance phase accounting for each completed lap
+      nextLapPhase();
+
+      // Pit at the END of the lap unless it's the final lap of the race
+      const isLastLapOfRace = (fuelLaps === 0);
+      const isLastLapOfStint = (age === stint.laps - 1);
+      if (isLastLapOfStint && !isLastLapOfRace) {
+        // Apply pit loss and reset age implicitly next loop
+        let pitLoss = sampleNormal(rand, pitLossBase, race.pitLossSigma);
+        // If we pit when SC/VSC is active, reduce pit time
+        if (p.kind === "SC") pitLoss = Math.max(0, pitLoss - sc.scPitReduction);
+        if (p.kind === "VSC") pitLoss = Math.max(0, pitLoss - sc.vscPitReduction);
+        time += pitLoss;
+      }
+    }
+  }
+
+  return time;
+}
+
+function summarize(times: number[]) {
+  const sorted = [...times].sort((a,b) => a - b);
+  const n = sorted.length;
+  const mean = sorted.reduce((a,b)=>a+b,0)/n;
+  const std = Math.sqrt(sorted.reduce((a,b)=>a+(b-mean)*(b-mean),0)/n);
+  const q = (p: number) => sorted[Math.max(0, Math.min(n-1, Math.floor(p*(n-1))))];
+  return {
+    mean,
+    std,
+    p10: q(0.10),
+    p25: q(0.25),
+    p50: q(0.50),
+    p75: q(0.75),
+    p90: q(0.90),
+    min: sorted[0],
+    max: sorted[n-1]
+  };
+}
+
+function formatTime(t: number) {
+  const minutes = Math.floor(t/60);
+  const seconds = t - minutes*60;
+  return `${minutes}:${seconds.toFixed(3).padStart(6,"0")}`;
+}
+
+function useDefaultModels(): TyreModels {
+  return {
+    S: { base: 79.6, deg: 0.085, warmup: 1.10 },
+    M: { base: 80.0, deg: 0.060, warmup: 0.90 },
+    H: { base: 80.7, deg: 0.045, warmup: 0.80 }
+  };
+}
+
+const COLORS = ["#60a5fa","#34d399","#f87171","#fbbf24","#c084fc","#22d3ee","#f472b6","#a3e635"]; // nice tailwind palette
+
+function smallHistogram(values: number[], width=260, height=80, bins=24, color="#60a5fa") {
+  if (values.length === 0) return null;
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const eps = 1e-9;
+  const binSize = (max - min + eps) / bins;
+  const counts = new Array(bins).fill(0);
+  values.forEach(v => {
+    let idx = Math.floor((v - min) / binSize);
+    if (idx >= bins) idx = bins-1;
+    counts[idx]++;
+  });
+  const maxCount = Math.max(...counts, 1);
+  const barW = width / bins;
+  const bars = counts.map((c, i) => {
+    const h = (c / maxCount) * (height - 10);
+    const x = i * barW;
+    const y = height - h;
+    return <rect key={i} x={x} y={y} width={Math.max(1, barW-2)} height={h} fill={color} opacity={0.9}/>;
+  });
+  return (
+    <svg width={width} height={height} className="rounded-md bg-slate-800/60">
+      {bars}
+    </svg>
+  );
+}
+
+function StrategyEditor({strategy, onChange, onRemove}:{strategy: Strategy, onChange:(s:Strategy)=>void, onRemove:()=>void}){
+  const updateStint = (idx:number, patch: Partial<Stint>) => {
+    const st = strategy.stints.map((s,i)=> i===idx ? {...s, ...patch} : s);
+    onChange({...strategy, stints: st});
+  };
+  const addStint = () => {
+    onChange({...strategy, stints: [...strategy.stints, {compound:"M", laps: 10}]});
+  };
+  const removeStint = (idx:number) => {
+    const st = strategy.stints.filter((_,i)=>i!==idx);
+    onChange({...strategy, stints: st});
+  };
+  return (
+    <div className="p-3 bg-slate-800/70 rounded-2xl border border-slate-700 space-y-3">
+      <div className="flex items-center gap-2">
+        <div className="w-3 h-3 rounded-full" style={{background: strategy.color}}/>
+        <input className="bg-transparent border border-slate-600 rounded px-2 py-1 text-white text-sm"
+          value={strategy.name} onChange={(e)=>onChange({...strategy, name:e.target.value})}/>
+        <button className="ml-auto text-red-300 hover:text-red-200 text-sm" onClick={onRemove}>Remove</button>
+      </div>
+      <div className="grid grid-cols-12 gap-2 items-center">
+        <div className="col-span-12 text-xs text-slate-300">Stints (compound & laps):</div>
+        {strategy.stints.map((st, idx)=> (
+          <div key={idx} className="col-span-12 grid grid-cols-12 gap-2 items-center">
+            <select value={st.compound} onChange={e=>updateStint(idx,{compound: e.target.value as Compound})}
+              className="col-span-3 bg-slate-900 border border-slate-600 rounded px-2 py-1 text-white">
+              <option value="S">Soft</option>
+              <option value="M">Medium</option>
+              <option value="H">Hard</option>
+            </select>
+            <input type="number" min={1} value={st.laps}
+              onChange={e=>updateStint(idx,{laps: parseInt(e.target.value||"0")})}
+              className="col-span-5 bg-slate-900 border border-slate-600 rounded px-2 py-1 text-white"/>
+            <button onClick={()=>removeStint(idx)} className="col-span-2 text-xs text-slate-300 hover:text-white">Delete</button>
+          </div>
+        ))}
+        <button onClick={addStint} className="col-span-4 bg-slate-700 hover:bg-slate-600 rounded px-2 py-1 text-xs">+ Add stint</button>
+      </div>
+    </div>
+  );
+}
+
+export default function App(){
+  const [tyres, setTyres] = useState<TyreModels>(useDefaultModels());
+  const [race, setRace] = useState<RaceSettings>({
+    laps: 70,
+    fuelPerLap: 0.035,
+    noiseSigma: 0.20,
+    trafficProb: 0.06,
+    trafficMax: 0.50,
+    pitLossMean: 20.5,
+    pitLossSigma: 0.35,
+    seed: 42,
+    sims: 3000,
+  });
+  const [sc, setSC] = useState<SafetyCarSettings>({
+    scStartProb: 0.015,
+    scMin: 3,
+    scMax: 6,
+    scLapDelta: 18.0,
+    scPitReduction: 9.5,
+    vscStartProb: 0.020,
+    vscMin: 2,
+    vscMax: 4,
+    vscLapDelta: 9.0,
+    vscPitReduction: 4.5,
+  });
+
+  const [strategies, setStrategies] = useState<Strategy[]>([
+    { id: "A", name: "Plan A – M→H (1-stop)", color: COLORS[0], stints: [ {compound:"M", laps: 28}, {compound:"H", laps: 42} ] },
+    { id: "B", name: "Plan B – M→M→H (2-stop)", color: COLORS[2], stints: [ {compound:"M", laps: 20}, {compound:"M", laps: 25}, {compound:"H", laps: 25} ] },
+  ]);
+
+  const [running, setRunning] = useState(false);
+  const [results, setResults] = useState<Record<string, number[]>>({});
+
+  const addStrategy = () => {
+    const color = COLORS[(strategies.length) % COLORS.length];
+    const newStrat: Strategy = {
+      id: Math.random().toString(36).slice(2,7),
+      name: `Plan ${String.fromCharCode(65 + strategies.length)}`,
+      color,
+      stints: [{compound:"M", laps: Math.max(10, Math.floor(race.laps/2))}, {compound:"H", laps: Math.floor(race.laps/2)}]
+    };
+    setStrategies(prev=>[...prev,newStrat]);
+  };
+
+  const removeStrategy = (id: string) => setStrategies(prev=> prev.filter(s=>s.id!==id));
+
+  const updateStrategy = (id:string, patch: Partial<Strategy>) => {
+    setStrategies(prev=> prev.map(s=> s.id===id ? {...s, ...patch} : s));
+  };
+
+  const totalStintLaps = (s: Strategy) => s.stints.reduce((a,st)=>a+st.laps,0);
+
+  const runSim = async () => {
+    setRunning(true);
+    // Shared schedules per sim index for fair comparison
+    const baseRand = mulberry32(race.seed);
+    // Pre-generate per-sim sub-seeds to avoid cross-correlation
+    const subSeeds = new Array(race.sims).fill(0).map(()=> Math.floor(baseRand()*1e9));
+
+    const acc: Record<string, number[]> = {};
+    strategies.forEach(s=> acc[s.id] = []);
+
+    // Monte Carlo loop
+    for (let simIdx=0; simIdx<race.sims; simIdx++) {
+      const r = mulberry32(subSeeds[simIdx]);
+      const phases = generateRacePhases(r, race.laps, sc);
+      // For each strategy, use a derivative seed (same SC schedule, different noise)
+      for (let k=0; k<strategies.length; k++) {
+        const s = strategies[k];
+        const r2 = mulberry32(subSeeds[simIdx] + (k+1)*9973);
+        const t = simulateStrategy(JSON.parse(JSON.stringify(s)), tyres, race, sc, phases, r2);
+        acc[s.id].push(t);
+      }
+    }
+    setResults(acc);
+    setRunning(false);
+  };
+
+  const stats = useMemo(()=>{
+    const out: Record<string, ReturnType<typeof summarize> & {count:number}> = {};
+    for (const [id, arr] of Object.entries(results)) {
+      if (!arr || arr.length === 0) continue;
+      out[id] = { ...summarize(arr), count: arr.length };
+    }
+    return out;
+  }, [results]);
+
+  const probBest = useMemo(()=>{
+    // Probability a strategy is the fastest among the set (per-sim argmin)
+    const ids = strategies.map(s=>s.id);
+    const n = race.sims;
+    const wins: Record<string, number> = {};
+    ids.forEach(id => wins[id]=0);
+    for (let i=0;i<n;i++){
+      let bestId = ids[0];
+      let bestT = results[bestId]?.[i] ?? Infinity;
+      for (const id of ids) {
+        const t = results[id]?.[i] ?? Infinity;
+        if (t < bestT) { bestT = t; bestId = id; }
+      }
+      if (bestId) wins[bestId] += 1;
+    }
+    const probs: Record<string, number> = {};
+    ids.forEach(id=> probs[id] = n>0 ? (wins[id]/n) : 0);
+    return probs;
+  }, [results, strategies, race.sims]);
+
+  // Undercut / Overcut quick advisor
+  const [ucCompound, setUcCompound] = useState<Compound>("M");
+  const [ucDegRival, setUcDegRival] = useState(0.06);
+  const [ucOutlapPenalty, setUcOutlapPenalty] = useState(1.3); // out-lap loss vs race pace
+  const [ucLapsStayedOut, setUcLapsStayedOut] = useState(1);
+
+  const undercutGain = useMemo(()=>{
+    // Simple model: rival stays out N laps and degrades; you box now and take out-lap penalty
+    // Gain ≈ rival extra degradation over N laps – your out-lap penalty
+    const rivalExtra = ucDegRival * ucLapsStayedOut; // s
+    const gain = rivalExtra - ucOutlapPenalty;
+    return gain;
+  }, [ucDegRival, ucOutlapPenalty, ucLapsStayedOut]);
+
+  return (
+    <div className="min-h-screen w-full bg-slate-950 text-white p-6">
+      <div className="max-w-7xl mx-auto grid grid-cols-12 gap-6">
+        <header className="col-span-12">
+          <h1 className="text-3xl font-bold tracking-tight">F1 Manager 2024 – Monte Carlo Strategy Lab</h1>
+          <p className="text-slate-300 mt-1">Simulate thousands of race universes using your FP/Q data. Compare strategies, SC windows, and undercut risk in one place.</p>
+        </header>
+
+        {/* Left column – Inputs */}
+        <section className="col-span-12 lg:col-span-5 space-y-6">
+          {/* Race Settings */}
+          <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-700">
+            <h2 className="font-semibold mb-3">Race Settings</h2>
+            <div className="grid grid-cols-12 gap-3 text-sm">
+              <label className="col-span-6">Laps
+                <input type="number" className="mt-1 w-full bg-slate-800 border border-slate-600 rounded px-2 py-1" value={race.laps}
+                  onChange={e=>setRace({...race, laps: parseInt(e.target.value||"0")})}/>
+              </label>
+              <label className="col-span-6">Sims
+                <input type="number" className="mt-1 w-full bg-slate-800 border border-slate-600 rounded px-2 py-1" value={race.sims}
+                  onChange={e=>setRace({...race, sims: parseInt(e.target.value||"0")})}/>
+              </label>
+              <label className="col-span-6">Fuel effect (s/lap/lap)
+                <input type="number" step="0.001" className="mt-1 w-full bg-slate-800 border border-slate-600 rounded px-2 py-1" value={race.fuelPerLap}
+                  onChange={e=>setRace({...race, fuelPerLap: parseFloat(e.target.value||"0")})}/>
+              </label>
+              <label className="col-span-6">Driver noise σ (s)
+                <input type="number" step="0.01" className="mt-1 w-full bg-slate-800 border border-slate-600 rounded px-2 py-1" value={race.noiseSigma}
+                  onChange={e=>setRace({...race, noiseSigma: parseFloat(e.target.value||"0")})}/>
+              </label>
+              <label className="col-span-6">Traffic prob / lap
+                <input type="number" step="0.001" className="mt-1 w-full bg-slate-800 border border-slate-600 rounded px-2 py-1" value={race.trafficProb}
+                  onChange={e=>setRace({...race, trafficProb: parseFloat(e.target.value||"0")})}/>
+              </label>
+              <label className="col-span-6">Traffic max add (s)
+                <input type="number" step="0.01" className="mt-1 w-full bg-slate-800 border border-slate-600 rounded px-2 py-1" value={race.trafficMax}
+                  onChange={e=>setRace({...race, trafficMax: parseFloat(e.target.value||"0")})}/>
+              </label>
+              <label className="col-span-6">Pit loss mean (s)
+                <input type="number" step="0.1" className="mt-1 w-full bg-slate-800 border border-slate-600 rounded px-2 py-1" value={race.pitLossMean}
+                  onChange={e=>setRace({...race, pitLossMean: parseFloat(e.target.value||"0")})}/>
+              </label>
+              <label className="col-span-6">Pit loss σ (s)
+                <input type="number" step="0.01" className="mt-1 w-full bg-slate-800 border border-slate-600 rounded px-2 py-1" value={race.pitLossSigma}
+                  onChange={e=>setRace({...race, pitLossSigma: parseFloat(e.target.value||"0")})}/>
+              </label>
+              <label className="col-span-6">Seed
+                <input type="number" className="mt-1 w-full bg-slate-800 border border-slate-600 rounded px-2 py-1" value={race.seed}
+                  onChange={e=>setRace({...race, seed: parseInt(e.target.value||"0")})}/>
+              </label>
+            </div>
+          </div>
+
+          {/* Tyre Models */}
+          <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-700">
+            <h2 className="font-semibold mb-3">Tyre Models (from FP/Quali)</h2>
+            {(["S","M","H"] as Compound[]).map((c)=> (
+              <div key={c} className="grid grid-cols-12 gap-3 text-sm mb-2">
+                <div className="col-span-12 font-medium">{c === "S" ? "Soft" : c === "M" ? "Medium" : "Hard"}</div>
+                <label className="col-span-4">Base (s)
+                  <input type="number" step="0.001" className="mt-1 w-full bg-slate-800 border border-slate-600 rounded px-2 py-1"
+                    value={tyres[c].base}
+                    onChange={e=>setTyres({...tyres, [c]:{...tyres[c], base: parseFloat(e.target.value||"0")}})} />
+                </label>
+                <label className="col-span-4">Deg (s/lap)
+                  <input type="number" step="0.001" className="mt-1 w-full bg-slate-800 border border-slate-600 rounded px-2 py-1"
+                    value={tyres[c].deg}
+                    onChange={e=>setTyres({...tyres, [c]:{...tyres[c], deg: parseFloat(e.target.value||"0")}})} />
+                </label>
+                <label className="col-span-4">Warmup (s)
+                  <input type="number" step="0.01" className="mt-1 w-full bg-slate-800 border border-slate-600 rounded px-2 py-1"
+                    value={tyres[c].warmup}
+                    onChange={e=>setTyres({...tyres, [c]:{...tyres[c], warmup: parseFloat(e.target.value||"0")}})} />
+                </label>
+              </div>
+            ))}
+          </div>
+
+          {/* Safety Car / VSC */}
+          <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-700">
+            <h2 className="font-semibold mb-3">Safety Car / VSC</h2>
+            <div className="grid grid-cols-12 gap-3 text-sm">
+              <div className="col-span-12 font-medium">Safety Car</div>
+              <label className="col-span-4">Start prob / lap
+                <input type="number" step="0.001" className="mt-1 w-full bg-slate-800 border border-slate-600 rounded px-2 py-1" value={sc.scStartProb}
+                  onChange={e=>setSC({...sc, scStartProb: parseFloat(e.target.value||"0")})}/>
+              </label>
+              <label className="col-span-4">Dur min (laps)
+                <input type="number" className="mt-1 w-full bg-slate-800 border border-slate-600 rounded px-2 py-1" value={sc.scMin}
+                  onChange={e=>setSC({...sc, scMin: parseInt(e.target.value||"0")})}/>
+              </label>
+              <label className="col-span-4">Dur max (laps)
+                <input type="number" className="mt-1 w-full bg-slate-800 border border-slate-600 rounded px-2 py-1" value={sc.scMax}
+                  onChange={e=>setSC({...sc, scMax: parseInt(e.target.value||"0")})}/>
+              </label>
+              <label className="col-span-4">Lap delta (s)
+                <input type="number" step="0.1" className="mt-1 w-full bg-slate-800 border border-slate-600 rounded px-2 py-1" value={sc.scLapDelta}
+                  onChange={e=>setSC({...sc, scLapDelta: parseFloat(e.target.value||"0")})}/>
+              </label>
+              <label className="col-span-4">Pit reduction (s)
+                <input type="number" step="0.1" className="mt-1 w-full bg-slate-800 border border-slate-600 rounded px-2 py-1" value={sc.scPitReduction}
+                  onChange={e=>setSC({...sc, scPitReduction: parseFloat(e.target.value||"0")})}/>
+              </label>
+
+              <div className="col-span-12 font-medium mt-2">VSC</div>
+              <label className="col-span-4">Start prob / lap
+                <input type="number" step="0.001" className="mt-1 w-full bg-slate-800 border border-slate-600 rounded px-2 py-1" value={sc.vscStartProb}
+                  onChange={e=>setSC({...sc, vscStartProb: parseFloat(e.target.value||"0")})}/>
+              </label>
+              <label className="col-span-4">Dur min (laps)
+                <input type="number" className="mt-1 w-full bg-slate-800 border border-slate-600 rounded px-2 py-1" value={sc.vscMin}
+                  onChange={e=>setSC({...sc, vscMin: parseInt(e.target.value||"0")})}/>
+              </label>
+              <label className="col-span-4">Dur max (laps)
+                <input type="number" className="mt-1 w-full bg-slate-800 border border-slate-600 rounded px-2 py-1" value={sc.vscMax}
+                  onChange={e=>setSC({...sc, vscMax: parseInt(e.target.value||"0")})}/>
+              </label>
+              <label className="col-span-4">Lap delta (s)
+                <input type="number" step="0.1" className="mt-1 w-full bg-slate-800 border border-slate-600 rounded px-2 py-1" value={sc.vscLapDelta}
+                  onChange={e=>setSC({...sc, vscLapDelta: parseFloat(e.target.value||"0")})}/>
+              </label>
+              <label className="col-span-4">Pit reduction (s)
+                <input type="number" step="0.1" className="mt-1 w-full bg-slate-800 border border-slate-600 rounded px-2 py-1" value={sc.vscPitReduction}
+                  onChange={e=>setSC({...sc, vscPitReduction: parseFloat(e.target.value||"0")})}/>
+              </label>
+            </div>
+          </div>
+
+          {/* Strategies */}
+          <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-700 space-y-3">
+            <div className="flex items-center gap-2">
+              <h2 className="font-semibold">Strategies</h2>
+              <button onClick={addStrategy} className="ml-auto bg-slate-700 hover:bg-slate-600 rounded px-2 py-1 text-sm">+ Add</button>
+            </div>
+            {strategies.map((s)=> (
+              <StrategyEditor key={s.id} strategy={s} onChange={(ns)=>updateStrategy(s.id, ns)} onRemove={()=>removeStrategy(s.id)}/>
+            ))}
+            <div className="text-xs text-slate-400">Tip: sum of stint laps should equal total race laps ({race.laps}). The simulator will auto-adjust the last stint if there's a mismatch.</div>
+          </div>
+
+          {/* Run */}
+          <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-700">
+            <button onClick={runSim} disabled={running}
+              className={`w-full rounded-xl px-4 py-3 font-semibold ${running?"bg-slate-700":"bg-emerald-600 hover:bg-emerald-500"}`}>
+              {running ? "Simulating…" : `Run ${race.sims.toLocaleString()} Monte Carlo sims`}
+            </button>
+            <div className="text-xs text-slate-400 mt-2">Strategies share the same random SC/VSC schedule each run for fair comparisons.</div>
+          </div>
+        </section>
+
+        {/* Right column – Outputs */}
+        <section className="col-span-12 lg:col-span-7 space-y-6">
+          {/* Summary Table */}
+          <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-700">
+            <h2 className="font-semibold mb-3">Results</h2>
+            <div className="overflow-x-auto">
+              <table className="min-w-full text-sm">
+                <thead>
+                  <tr className="text-left text-slate-300">
+                    <th className="py-2">Strategy</th>
+                    <th className="py-2">Mean</th>
+                    <th className="py-2">P50</th>
+                    <th className="py-2">P10</th>
+                    <th className="py-2">P90</th>
+                    <th className="py-2">Std</th>
+                    <th className="py-2">Best%</th>
+                    <th className="py-2">Samples</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {strategies.map((s)=>{
+                    const st = stats[s.id];
+                    return (
+                      <tr key={s.id} className="border-t border-slate-800">
+                        <td className="py-2"><div className="flex items-center gap-2"><span className="inline-block w-3 h-3 rounded-full" style={{background:s.color}}/> {s.name}</div></td>
+                        <td className="py-2">{st? formatTime(st.mean):"–"}</td>
+                        <td className="py-2">{st? formatTime(st.p50):"–"}</td>
+                        <td className="py-2">{st? formatTime(st.p10):"–"}</td>
+                        <td className="py-2">{st? formatTime(st.p90):"–"}</td>
+                        <td className="py-2">{st? st.std.toFixed(3):"–"}</td>
+                        <td className="py-2">{probBest[s.id] ? Math.round(probBest[s.id]*100) + "%" : "–"}</td>
+                        <td className="py-2">{stats[s.id]?.count ?? 0}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* Histograms */}
+          <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-700">
+            <h2 className="font-semibold mb-3">Distributions (lower is faster)</h2>
+            <div className="grid grid-cols-1 gap-4">
+              {strategies.map((s)=> (
+                <div key={s.id} className="flex items-center gap-4">
+                  <div className="w-44 text-sm"><div className="flex items-center gap-2"><span className="inline-block w-3 h-3 rounded-full" style={{background:s.color}}/> {s.name}</div>
+                    <div className="text-xs text-slate-400">{results[s.id]?.length ? `${formatTime(Math.min(...results[s.id]))} – ${formatTime(Math.max(...results[s.id]))}` : ""}</div>
+                  </div>
+                  <div>
+                    {smallHistogram(results[s.id] || [], 420, 90, 28, s.color)}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Undercut Advisor */}
+          <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-700">
+            <h2 className="font-semibold mb-3">Undercut / Overcut Advisor (quick calc)</h2>
+            <div className="grid grid-cols-12 gap-3 text-sm items-end">
+              <label className="col-span-3">Compound
+                <select className="mt-1 w-full bg-slate-800 border border-slate-600 rounded px-2 py-1" value={ucCompound} onChange={e=>setUcCompound(e.target.value as Compound)}>
+                  <option value="S">Soft</option>
+                  <option value="M">Medium</option>
+                  <option value="H">Hard</option>
+                </select>
+              </label>
+              <label className="col-span-3">Rival deg (s/lap)
+                <input type="number" step="0.001" className="mt-1 w-full bg-slate-800 border border-slate-600 rounded px-2 py-1" value={ucDegRival}
+                  onChange={e=>setUcDegRival(parseFloat(e.target.value||"0"))}/>
+              </label>
+              <label className="col-span-3">Your out-lap penalty (s)
+                <input type="number" step="0.01" className="mt-1 w-full bg-slate-800 border border-slate-600 rounded px-2 py-1" value={ucOutlapPenalty}
+                  onChange={e=>setUcOutlapPenalty(parseFloat(e.target.value||"0"))}/>
+              </label>
+              <label className="col-span-3">Rival stays out (laps)
+                <input type="number" className="mt-1 w-full bg-slate-800 border border-slate-600 rounded px-2 py-1" value={ucLapsStayedOut}
+                  onChange={e=>setUcLapsStayedOut(parseInt(e.target.value||"0"))}/>
+              </label>
+              <div className="col-span-12 text-slate-300">Est. undercut gain: <span className={`${undercutGain>=0?"text-emerald-400":"text-red-400"} font-semibold`}>{undercutGain.toFixed(3)} s</span> {undercutGain>=0?"(box now looks good)":"(likely not enough)"}</div>
+              <div className="col-span-12 text-xs text-slate-400">Rule of thumb: if gain ≥ ~0.8s and rejoin is clean air, pull the trigger. If rival deg is trending up or you can pit under VSC/SC, required gain threshold drops.</div>
+            </div>
+          </div>
+
+          {/* Help */}
+          <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-700">
+            <h2 className="font-semibold mb-2">How to calibrate from your FP/Quali</h2>
+            <ul className="list-disc list-inside text-sm text-slate-300 space-y-1">
+              <li>From long runs, fit <span className="font-mono">base</span> and <span className="font-mono">deg</span> per compound. If you don’t want to regress, eyeball the slope of laptime vs lap number.</li>
+              <li>Estimate <span className="font-mono">fuelPerLap</span> by comparing early vs late laps on stable tyres (typical 0.02–0.05 s/lap/lap).</li>
+              <li>Find track-specific <span className="font-mono">pitLossMean</span> from the sim UI or timing (entry→exit time loss).</li>
+              <li>Safety car rates can be track dependent; tweak until it “feels” like the venue in your save.</li>
+              <li>Build 2–3 realistic strategies and compare their mean and spread. The one with the best <em>Best%</em> and tighter spread is your low-variance play.</li>
+            </ul>
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}
