@@ -17,7 +17,7 @@ A React-based single-file simulation tool that brings **race strategy Monte Carl
 ### Install
 Clone the repository and install dependencies:
 ```bash
-git clone https://github.com/yourname/f1-montecarlo-lab.git
+git clone https://github.com/MBicanov/f1-montecarlo-lab.git
 cd f1-montecarlo-lab
 npm install
 ```
